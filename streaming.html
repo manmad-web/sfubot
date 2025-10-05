@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AskSFU - Streaming Chat with Web Search</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .typing-indicator {
+            display: none;
+            color: #666;
+            font-style: italic;
+            margin: 10px 0;
+        }
+        
+        .typing-indicator.show {
+            display: block;
+        }
+        
+        .typing-dots {
+            display: inline-block;
+            animation: typing 1.5s infinite;
+        }
+        
+        @keyframes typing {
+            0%, 60%, 100% { opacity: 0; }
+            30% { opacity: 1; }
+        }
+        
+        .streaming-message {
+            background: #f0f8ff;
+            border-left: 3px solid #007bff;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 5px;
+        }
+        
+        .connection-status {
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            padding: 5px 10px;
+            border-radius: 15px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        
+        .connected {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .disconnected {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .web-search-indicator {
+            background: #e8f5e8;
+            border-left: 3px solid #28a745;
+            padding: 8px;
+            margin: 5px 0;
+            border-radius: 5px;
+            font-size: 12px;
+            color: #155724;
+            display: none;
+        }
+        
+        .web-search-indicator.show {
+            display: block;
+        }
+        
+        .sources-section {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            padding: 10px;
+            margin: 10px 0;
+        }
+        
+        .sources-section h4 {
+            margin: 0 0 8px 0;
+            color: #495057;
+            font-size: 14px;
+        }
+        
+        .source-link {
+            display: block;
+            color: #007bff;
+            text-decoration: none;
+            margin: 5px 0;
+            font-size: 13px;
+            padding: 3px 0;
+        }
+        
+        .source-link:hover {
+            text-decoration: underline;
+        }
+        
+        .search-icon {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            margin-right: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="connection-status" id="connectionStatus">Connecting...</div>
+    
+    <div class="container">
+        <div class="header">
+            <img src="assets/asksfu-header.png" alt="AskSFU Header" class="header-image">
+            <h1>AskSFU - Streaming Chat with Web Search</h1>
+            <p>Your AI assistant for Simon Fraser University with real-time streaming responses and live web search!</p>
+        </div>
+
+        <div class="chat-container">
+            <div class="chat-messages" id="chatMessages">
+                <div class="message bot-message">
+                    <img src="assets/smile.png" alt="Bot" class="message-avatar">
+                    <div class="message-content">
+                        <p>Hello! I'm AskSFU, your AI assistant for Simon Fraser University. I now support:</p>
+                        <ul>
+                            <li>🚀 <strong>Real-time streaming responses</strong> - Watch me type in real-time!</li>
+                            <li>🌐 <strong>Live web search</strong> - Get current information about professors, financial aid, contacts, and more!</li>
+                            <li>📚 <strong>SFU knowledge base</strong> - Access to courses, programs, and clubs</li>
+                            <li>💬 <strong>Chat history</strong> - Remember our conversation context</li>
+                        </ul>
+                        <p>Try asking about current SFU information like "professor contact information" or "financial aid deadlines"!</p>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="web-search-indicator" id="webSearchIndicator">
+                <span class="search-icon">🔍</span>
+                <span>Searching SFU websites for current information...</span>
+            </div>
+            
+            <div class="typing-indicator" id="typingIndicator">
+                <img src="assets/think.png" alt="Bot" class="message-avatar">
+                <div class="message-content">
+                    <span>AskSFU is typing</span>
+                    <span class="typing-dots">...</span>
+                </div>
+            </div>
+            
+            <div class="input-container">
+                <input type="text" id="userInput" placeholder="Ask me anything about SFU... (try 'professor contacts' or 'financial aid')" maxlength="500">
+                <button id="sendButton">Send</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // WebSocket connection
+        let ws;
+        let sessionId = 'session_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+        let isConnected = false;
+        
+        // DOM elements
+        const chatMessages = document.getElementById('chatMessages');
+        const userInput = document.getElementById('userInput');
+        const sendButton = document.getElementById('sendButton');
+        const typingIndicator = document.getElementById('typingIndicator');
+        const webSearchIndicator = document.getElementById('webSearchIndicator');
+        const connectionStatus = document.getElementById('connectionStatus');
+        
+        // Initialize WebSocket connection
+        function initWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}`;
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = function() {
+                console.log('WebSocket connected');
+                isConnected = true;
+                connectionStatus.textContent = 'Connected';
+                connectionStatus.className = 'connection-status connected';
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                handleWebSocketMessage(data);
+            };
+            
+            ws.onclose = function() {
+                console.log('WebSocket disconnected');
+                isConnected = false;
+                connectionStatus.textContent = 'Disconnected';
+                connectionStatus.className = 'connection-status disconnected';
+                
+                // Try to reconnect after 3 seconds
+                setTimeout(initWebSocket, 3000);
+            };
+            
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                isConnected = false;
+                connectionStatus.textContent = 'Error';
+                connectionStatus.className = 'connection-status disconnected';
+            };
+        }
+        
+        // Handle WebSocket messages
+        function handleWebSocketMessage(data) {
+            switch(data.type) {
+                case 'typing':
+                    if (data.isTyping) {
+                        showTypingIndicator();
+                    } else {
+                        hideTypingIndicator();
+                    }
+                    break;
+                    
+                case 'web_search':
+                    showWebSearchIndicator();
+                    break;
+                    
+                case 'stream':
+                    updateStreamingMessage(data.content, data.isComplete);
+                    break;
+                    
+                case 'message':
+                    hideTypingIndicator();
+                    hideWebSearchIndicator();
+                    addMessage(data.content, 'bot');
+                    break;
+                    
+                case 'error':
+                    hideTypingIndicator();
+                    hideWebSearchIndicator();
+                    addMessage(`Error: ${data.message}`, 'bot');
+                    break;
+            }
+        }
+        
+        // Show typing indicator
+        function showTypingIndicator() {
+            typingIndicator.classList.add('show');
+        }
+        
+        // Hide typing indicator
+        function hideTypingIndicator() {
+            typingIndicator.classList.remove('show');
+        }
+        
+        // Show web search indicator
+        function showWebSearchIndicator() {
+            webSearchIndicator.classList.add('show');
+        }
+        
+        // Hide web search indicator
+        function hideWebSearchIndicator() {
+            webSearchIndicator.classList.remove('show');
+        }
+        
+        // Update streaming message
+        function updateStreamingMessage(content, isComplete) {
+            let streamingDiv = document.getElementById('streamingMessage');
+            
+            if (!streamingDiv) {
+                streamingDiv = document.createElement('div');
+                streamingDiv.id = 'streamingMessage';
+                streamingDiv.className = 'message bot-message streaming-message';
+                streamingDiv.innerHTML = `
+                    <img src="assets/think.png" alt="Bot" class="message-avatar">
+                    <div class="message-content">
+                        <p></p>
+                    </div>
+                `;
+                chatMessages.appendChild(streamingDiv);
+            }
+            
+            const contentDiv = streamingDiv.querySelector('.message-content p');
+            contentDiv.innerHTML = formatMessageContent(content);
+            
+            if (isComplete) {
+                streamingDiv.id = '';
+                streamingDiv.className = 'message bot-message';
+                streamingDiv.querySelector('img').src = 'assets/smile.png';
+            }
+            
+            scrollToBottom();
+        }
+        
+        // Format message content with proper links and sources
+        function formatMessageContent(content) {
+            // Convert markdown-style links to HTML
+            content = content.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" class="source-link">$1</a>');
+            
+            // Convert line breaks
+            content = content.replace(/\n/g, '<br>');
+            
+            // Format sources section
+            content = content.replace(/\*\*Sources:\*\*/g, '<div class="sources-section"><h4>📚 Sources:</h4>');
+            content = content.replace(/(\d+\.\s*<a[^>]+>[^<]+<\/a>)/g, '$1');
+            
+            return content;
+        }
+        
+        // Add message to chat
+        function addMessage(content, sender) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${sender}-message`;
+            
+            const avatarSrc = sender === 'bot' ? 'assets/smile.png' : 'assets/grey-logo-Photoroom.png';
+            
+            messageDiv.innerHTML = `
+                <img src="${avatarSrc}" alt="${sender}" class="message-avatar">
+                <div class="message-content">
+                    <p>${formatMessageContent(content)}</p>
+                </div>
+            `;
+            
+            chatMessages.appendChild(messageDiv);
+            scrollToBottom();
+        }
+        
+        // Send message
+        function sendMessage() {
+            const message = userInput.value.trim();
+            if (!message || !isConnected) return;
+            
+            // Add user message to chat
+            addMessage(message, 'user');
+            
+            // Send via WebSocket
+            ws.send(JSON.stringify({
+                type: 'chat',
+                message: message,
+                sessionId: sessionId
+            }));
+            
+            // Clear input
+            userInput.value = '';
+        }
+        
+        // Scroll to bottom
+        function scrollToBottom() {
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        // Event listeners
+        sendButton.addEventListener('click', sendMessage);
+        userInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+        
+        // Initialize WebSocket connection
+        initWebSocket();
+        
+        // Focus input on load
+        userInput.focus();
+    </script>
+</body>
+</html>

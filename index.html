@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>AskSFU</title>
+  <link rel="stylesheet" href="styles.css" />
+  
+  <!-- React CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  
+  <!-- OGL Library for WebGL -->
+  <script src="https://unpkg.com/ogl@1.0.6/dist/ogl.umd.js"></script>
+</head>
+<body>
+  <!-- Header with Custom Red Design -->
+  <header>
+    <div class="header-left">
+      <img
+        src="assets/asksfu-header.png"
+        alt="AskSFU Header"
+        class="custom-header"
+      />
+    </div>
+
+    <!-- Buttons on the top-right corner of the page -->
+    <div class="header-right">
+      <button id="theme-toggle">🌙</button>
+      <button id="map-button" onclick="window.location.href='map.html'">Campus</button>
+      <button id="news-button" onclick="window.location.href='news.html'">
+        News
+      </button>
+      <button id="events-button" onclick="window.location.href='events.html'">
+        Events
+      </button>
+    </div>
+  </header>
+
+
+  <!-- Main Content Area -->
+  <main>
+    <img
+      src="assets/grey-logo-Photoroom.png"
+      alt="Large SFU Logo"
+      class="large-logo"
+    />
+
+    <!-- Chat Box Area -->
+    <div class="chat-box" id="chat-box">
+      <!-- Messages will be appended here -->
+      <ul id="messages"></ul>
+    </div>
+  </main>
+  
+  <!-- Search Bar positioned above Community Chat -->
+  <div class="search-section">
+    <div class="chat-input-container">
+      <input
+        type="text"
+        id="user-input"
+        placeholder="Ask me anything..."
+        onkeypress="handleKeyPress(event)"
+      />
+      <button id="voice-button" class="voice-btn" title="Hold to speak">🎤</button>
+      <button onclick="sendMessage()">></button>
+    </div>
+  </div>
+  
+  <!-- Recording Indicator -->
+  <div id="recording-indicator" class="recording-indicator hidden">
+    <span class="recording-pulse"></span>
+    Recording...
+  </div>
+
+  <!-- Footer with Community Chat -->
+  <footer>
+    <button onclick="window.location.href='chat-rooms.html'">Community Chat</button>
+  </footer>
+
+    
+  <!-- Your other scripts -->
+  <script src="js/config.js"></script>
+  <script src="js/voiceInput.js"></script>
+  <script src="js/chatbot.js"></script>
+</body>
+</html>

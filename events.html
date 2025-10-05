@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>SFU Events | AskSFU</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Header with Custom Red Design -->
+  <header>
+    <div class="header-left">
+      <img
+        src="assets/asksfu-header.png"
+        alt="AskSFU Header"
+        class="custom-header"
+      />
+    </div>
+
+    <div class="header-right">
+      <!-- Link back to index.html or a Home button -->
+      <button id="theme-toggle">🌙</button>
+      <button onclick="window.location.href='index.html'">Chat</button>
+    </div>
+  </header>
+
+  <main class="news-page">
+    <h1 class="news-heading">SFU Events</h1>
+    <p class="news-subtitle">Upcoming campus activities and events at Simon Fraser University</p>
+    <!-- Container for the events blocks -->
+    <div id="events-container">
+      <!-- <p>Loading events...</p> -->
+      <div class="loading-spinner" id="loading-spinner"></div>
+    </div>
+  </main>
+
+  <!-- Load the script that handles fetching or displaying the events -->
+  <script src="events.js"></script>
+  <script src="theme.js"></script>
+
+</body>
+</html>

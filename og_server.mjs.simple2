@@ -1,0 +1,586 @@
+import dotenv from 'dotenv';
+import express from 'express';
+import cors from 'cors';
+import { GoogleGenAI } from '@google/genai';
+import axios from 'axios';
+import fs from 'fs';
+import * as cheerio from 'cheerio';
+import puppeteer from 'puppeteer';
+import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
+import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
+import { GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { createRetrievalChain } from "langchain/chains/retrieval";
+import { createStuffDocumentsChain } from "langchain/chains/combine_documents";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Serve static files
+app.use(express.static('.'));
+
+// Serve index.html at root
+app.get('/', (req, res) => {
+    res.sendFile('index.html', { root: '.' });
+});
+
+const SFU_BASE_URL = "https://www.sfu.ca/bin/wcm/course-outlines";
+const FLASK_SCRAPER_URL = "http://localhost:5001/scrape";
+
+const URLS = [
+    // Academic Programs
+    "https://www.sfu.ca/students/calendar/2025/summer/courses/cmpt.html",
+    "https://www.sfu.ca/students/calendar/2025/spring/programs/computing-science/major/bachelor-of-science-or-bachelor-of-arts.html",
+    "https://www.sfu.ca/students/calendar/2025/spring/programs/computing-science/minor.html",
+    "https://www.sfu.ca/students/admission/programs/a-z/c/computing-science/careers.html",
+    "https://www.sfu.ca/students/calendar/2025/spring/areas-of-study/engineering-science.html",
+    "https://www.sfu.ca/students/admission/programs/arts-social-sciences/certificates.html",
+    "https://www.sfu.ca/students/admission/programs/business/majors.html",
+    "https://www.sfu.ca/students/admission/programs/environment/minors.html",
+    "https://www.sfu.ca/students/admission/programs/environment/majors.html",
+    "https://www.sfu.ca/students/admission/programs/environment/joint-majors.html",
+    "https://www.sfu.ca/students/admission/programs/environment/certificates.html",
+    
+    // Student Services & Support (from sfu_scraper.py)
+    "https://go.sfss.ca/clubs/list",
+    "https://www.sfu.ca/food/wheretoeat.html",
+    "https://www.sfu.ca/students/financial-aid/undergraduate.html",
+    "https://www.sfu.ca/students/health/support-resources/counselling-services.html",
+    "https://www.sfu.ca/students/enrolment-services/appeals/admission-appeals.html",
+    "https://www.sfu.ca/students/enrolment-services/appeals.html",
+    "https://www.sfu.ca/students/contact/ris.html",
+    
+    // Academic Integrity
+    "https://www.sfu.ca/students/enrolment-services/academic-integrity/violations.html",
+    "https://www.sfu.ca/students/enrolment-services/academic-integrity/putting-yourself-at-risk.html",
+    "https://www.sfu.ca/students/enrolment-services/academic-integrity/support-and-resources.html",
+    "https://www.sfu.ca/students/enrolment-services/academic-integrity/using-generative-ai.html",
+    "https://www.sfu.ca/students/enrolment-services/academic-integrity/academic-disciplinary-process.html",
+    "https://www.sfu.ca/ombudsperson.html"
+];
+
+let vectorStore;
+let unionData = [];
+
+// Function to read and parse the CSV file
+function loadUnionData() {
+    try {
+        const csvContent = fs.readFileSync('./sfss_union_names.csv', 'utf8');
+        const lines = csvContent.split('\n');
+        // Skip header and empty lines
+        unionData = lines.slice(1).filter(line => line.trim() !== '').map(line => {
+            // Remove quotes and trim
+            return line.replace(/"/g, '').trim();
+        });
+        console.log(`📚 Loaded ${unionData.length} union/society names from CSV`);
+    } catch (error) {
+        console.error('❌ Error loading union data:', error);
+        unionData = [];
+    }
+}
+
+// Function to check if message contains union-related keywords
+function isUnionQuery(message) {
+    const unionKeywords = ['union', 'society', 'association', 'club', 'student organization', 'student group'];
+    const messageLower = message.toLowerCase();
+    return unionKeywords.some(keyword => messageLower.includes(keyword));
+}
+
+// Function to get relevant unions based on query
+function getRelevantUnions(message, limit = 10) {
+    const messageLower = message.toLowerCase();
+    const relevantUnions = [];
+    
+    // First, look for exact matches or close matches
+    for (const union of unionData) {
+        const unionLower = union.toLowerCase();
+        if (unionLower.includes(messageLower.replace(/union|society|association|club/g, '').trim()) ||
+            messageLower.includes(unionLower.split(' ')[0])) {
+            relevantUnions.push(union);
+        }
+    }
+    
+    // If no specific matches, return a random sample
+    if (relevantUnions.length === 0) {
+        const shuffled = [...unionData].sort(() => 0.5 - Math.random());
+        return shuffled.slice(0, limit);
+    }
+    
+    return relevantUnions.slice(0, limit);
+}
+
+async function initializeVectorStore() {
+    const loaders = URLS.map(url => new CheerioWebBaseLoader(url, {
+        selector: "body"
+    }));
+    const docs = await Promise.all(loaders.map(loader => loader.load()));
+    const flatDocs = docs.flat();
+
+    const textSplitter = new RecursiveCharacterTextSplitter({ chunkSize: 1000, chunkOverlap: 200 });
+    const splitDocs = await textSplitter.splitDocuments(flatDocs);
+
+    const embeddings = new GoogleGenerativeAIEmbeddings({ 
+        apiKey: process.env.GEMINI_API_KEY,
+        model: "text-embedding-004"
+    });
+    vectorStore = await MemoryVectorStore.fromDocuments(splitDocs, embeddings);
+    console.log("Vector store initialized.");
+}
+
+(async () => {
+    loadUnionData();
+    await initializeVectorStore();
+})();
+
+// Store course context globally
+let courseContext = {};
+
+
+const fetchAvailableSections = async (year, term, department, courseNumber) => {
+    if (!year || !term || !department || !courseNumber) {
+        return { error: "Missing required parameters for fetching course sections." };
+    }
+
+    const formattedCourseNumber = courseNumber.toString().toUpperCase();
+    const formattedTerm = term.toLowerCase();
+    const formattedDepartment = department.toUpperCase();
+    const url = `${SFU_BASE_URL}?${year}/${formattedTerm}/${formattedDepartment}/${formattedCourseNumber}`;
+    console.log(`🔍 Sections API URL: ${url}`);
+
+    try {
+        const response = await axios.get(url);
+        console.log(`📄 API Response:`, response.data); // Log the response data
+
+        // Filter sections to include only lectures (classType: 'e')
+        const sections = response.data.filter(sec => sec.classType === 'e');
+        if (!sections.length) {
+            console.log("❌ No lecture sections available for this course.");
+            return { error: "No lecture sections available for this course." };
+        }
+
+        return { sections };
+    } catch (error) {
+        console.log(`❌ Error fetching sections for ${courseNumber}: ${error}`);
+        return { error: "Could not fetch course sections. It may not exist." };
+    }
+};
+
+
+const fetchCourseOutline = async (year, term, department, courseNumber, section) => {
+    if (!year || !term || !department || !courseNumber) {
+        return { error: "Missing required parameters for fetching course outline." };
+    }
+
+    const formattedCourseNumber = courseNumber.toString().toUpperCase();
+    const formattedTerm = term.toLowerCase();
+    const formattedDepartment = department.toUpperCase();
+    const url = `${SFU_BASE_URL}?${year}/${formattedTerm}/${formattedDepartment}/${formattedCourseNumber}/${section}`;
+    console.log(`🔍 API URL: ${url}`);
+
+    try {
+        const response = await axios.get(url);
+        return { data: response.data, url }; // Include URL for further use
+    } catch (error) {
+        return { error: "Could not fetch course outline. It may not exist." };
+    }
+};
+
+const formatCourseOutline = (data, url) => {
+    if (!data.info) return "❌ Course outline not found.";
+
+    let outlineUrl = "";
+    try {
+        const [termPart, year] = data.info.term.toLowerCase().split(' ');
+        const [dept, courseNum, section] = data.info.name.toLowerCase().split(' ');
+        outlineUrl = `https://www.sfu.ca/outlines.html?${year}/${termPart}/${dept}/${courseNum}/${section}`;
+    } catch (error) {
+        outlineUrl = "URL generation failed - invalid course data format";
+    }
+
+    return `📚 *${data.info.title}* (${data.info.name})
+
+📅 *Term:* ${data.info.term}  
+🏛 *Campus:* ${data.courseSchedule?.[0]?.campus || "Not available"}  
+🎓 *Instructor:* ${data.instructor?.[0]?.name || "Not available"}  
+📖 *Description:* ${data.info.description}
+
+
+📝 *Prerequisites:* ${data.info.prerequisites || "None listed"}  
+
+📝 *Grading Notes:* ${data.info.gradingNotes || "Not specified"}  
+📚 *Required Texts:* ${data.requiredText?.map(t => t.details).join("\n") || "None listed"}  
+🗓 *Schedule:* ${data.courseSchedule?.map(s => `${s.days}: ${s.startTime} - ${s.endTime}`).join("\n") || "Not available"}  
+
+🔗 [Here is the provided link for the course outline for further info](${outlineUrl})
+`;
+};
+
+const extractCourseDetails = (message) => {
+    // Match year (e.g., 2023)
+    const yearMatch = message.match(/\b(20\d{2})\b/);
+    // Match term (case-insensitive)
+    const termMatch = message.match(/\b(spring|summer|fall)\b/i);
+    // Match department code (e.g., CMPT, MATH, etc.)
+    const departmentMatch = message.match(/\b([A-Za-z]{3,4})\s+\d{3}\b/);
+    // Match course number with optional trailing letters (e.g., 225, 225W)
+    const courseNumberMatch = message.match(/\b(\d{3}[A-Za-z]?)\b/);
+    
+    const sectionMatch = message.match(/\b([dD]\d{3})\b/); 
+
+    const year = yearMatch ? yearMatch[1] : null;
+    const term = termMatch ? termMatch[1].toLowerCase() : null;
+    const department = departmentMatch ? departmentMatch[1].toUpperCase() : null; // Ensure department is always uppercase
+    const courseNumber = courseNumberMatch ? courseNumberMatch[1].toUpperCase() : null;
+
+    const section = sectionMatch ? sectionMatch[1].toUpperCase() : null;
+
+    console.log(`🔍 Extracted Details -> Year: ${year}, Term: ${term}, Department: ${department}, Course Number: ${courseNumber}, Section: ${section}`);
+    return { year, term, department, courseNumber, section };
+};
+
+
+  
+
+app.post("/chat", async (req, res) => {
+    try {
+        const { message } = req.body;
+        console.log(`📝 User Message: ${message}`);
+
+        // Handle simple greetings without source links
+        const greetings = ["hi", "hello", "hey", "good morning", "good afternoon"];
+        if (greetings.includes(message.toLowerCase().trim())) {
+            return res.json({ response: "Hello! How can I assist you today?" });
+        }
+
+        // Check if this is a union/society query
+        if (isUnionQuery(message)) {
+            console.log("🏛️ Detected union/society query");
+            const relevantUnions = getRelevantUnions(message, 8);
+            
+            let response = "Here are some SFU student unions and societies:\n\n";
+            relevantUnions.forEach((union, index) => {
+                response += `${index + 1}. ${union}\n`;
+            });
+            
+            response += "\nThese student organizations provide great opportunities to connect with peers in your field of study and participate in academic and social activities!";
+            
+            return res.json({ response: response });
+        }
+
+        // Check if the user is providing a section directly (e.g., D100)
+        const sectionMatch = message.match(/^d\d{3}$/i);
+        if (sectionMatch) {
+            const section = sectionMatch[0].toUpperCase();
+            if (courseContext.year && courseContext.term && courseContext.department && courseContext.courseNumber) {
+                const { data, error, url } = await fetchCourseOutline(courseContext.year, courseContext.term, courseContext.department, courseContext.courseNumber, section);
+                if (error) {
+                    return res.status(404).json({ response: "Sorry, I couldn't find the course outline for that section. Please check the details and try again." });
+                }
+                const formattedOutline = formatCourseOutline(data, url);
+                return res.json({ response: formattedOutline });
+            } else {
+                return res.json({ response: "Please first ask for the course outline (e.g., CMPT 225 Summer 2024) before specifying the section." });
+            }
+        }
+
+        const { year, term, department, courseNumber } = extractCourseDetails(message);
+
+        if (department if (year && term && department && courseNumber) {if (year && term && department && courseNumber) { courseNumber) {
+            const defaultYear = year || "2024";
+            const defaultTerm = term || "fall";
+            // Store course context
+            courseContext = { year, term, department, courseNumber };
+
+            const { sections, error } = await fetchAvailableSections(year, term, department, courseNumber);
+            if (error || !sections.length) {
+                return res.status(404).json({ response: "No sections available for this course." });
+            }
+
+            const sectionList = sections.map(sec => `${sec.text} - ${sec.title}`).join("\n");
+            return res.json({
+                response: `Here are the available sections for ${department} ${courseNumber} (${term} ${year}):\n${sectionList}\n\nPlease type the section code (e.g., D100) to get the course outline.`
+            });
+        }
+
+        //const { year, term, department, courseNumber, section } = extractCourseDetails(message);
+
+        // Validate extracted details
+        // if (department if (year && term && department && courseNumber) {if (year && term && department && courseNumber) { courseNumber) {
+            const defaultYear = year || "2024";
+            const defaultTerm = term || "fall";
+        //     if (!section) {
+        //         // Step 1: No section provided, fetch available sections
+        //         const { sections, error } = await fetchAvailableSections(year, term, department, courseNumber);
+        //         if (error || !sections.length) {
+        //             return res.status(404).json({ response: "No sections available for this course." });
+        //         }
+
+        //         console.log(`✅ Available Sections for ${courseNumber}:`, sections); // Log the available sections
+            
+        //          // Step 2: Display available sections to the user
+        //         const sectionList = sections.map(sec => `${sec.text} - ${sec.title}`).join("\n");
+        //         return res.json({
+        //             response: `Here are the available sections for ${department} ${courseNumber} (${term} ${year}):\n${sectionList}\n\nPlease write in this format ${department} ${courseNumber} ${term} ${year} and then add the section by code (e.g., D100).`
+        //         });
+        //     }
+
+
+            //console.log("✅ Fetching course outline from REST API...");
+            // const courseOutline = await fetchCourseOutline(year, term, department, courseNumber);
+            // if (!courseOutline.error) {
+            //     const formattedOutline = formatCourseOutline(courseOutline.data, courseOutline.url);
+            //     return res.json({ response: formattedOutline });
+            // } else {
+            //     return res.json({ response: "Sorry, I couldn't find the course outline. Please check the details and try again." });
+            // }
+
+            // Step 3: Section provided, fetch the course outline
+        //     console.log(`✅ Fetching course outline for section ${section}...`);
+        //     const { data, error, url } = await fetchCourseOutline(year, term, department, courseNumber, section);
+        //     if (error) {
+        //         return res.status(404).json({ response: "Sorry, I couldn't find the course outline. Please check the details and try again." });
+        //     }
+        
+        //     console.log(`✅ Course outline fetched for ${department} ${courseNumber} ${section}`); // Log the success of the fetch
+        
+        //     const formattedOutline = formatCourseOutline(data, url);
+        //     return res.json({ response: formattedOutline });
+        // }
+
+
+        // Use LangChain retrieval chain for SFU data
+        console.log("🔍 Using LangChain retrieval chain for SFU data...");
+        const llm = new ChatGoogleGenerativeAI({
+            model: "gemini-2.5-flash",
+            apiKey: process.env.GEMINI_API_KEY,
+            maxOutputTokens: 1000
+        });
+
+        const promptTemplate = ChatPromptTemplate.fromTemplate(`You are a chat bot called AskSfu.
+            Answer the question based only on the following context:
+            {context}
+            
+            Question: {input}`);
+
+        const documentChain = await createStuffDocumentsChain({
+            llm,
+            prompt: promptTemplate
+        });
+
+        const retriever = vectorStore.asRetriever({
+            k: 5 // Retrieve top 5 most relevant documents
+        });
+
+        const retrievalChain = await createRetrievalChain({
+            combineDocsChain: documentChain,
+            retriever,
+        });
+
+        const result = await retrievalChain.invoke({
+            input: message,
+        });
+
+        // Check if the answer is derived from the vector store
+        let sourceUrl = "Source not available";
+        if (result.context && result.context[0] && result.context[0].metadata && result.context[0].metadata.source) {
+            sourceUrl = result.context[0].metadata.source;
+        }
+
+        // Append the source URL to the response only if it's available
+        let responseWithSource = result.answer;
+        if (sourceUrl !== "Source not available" && result.answer.toLowerCase() !== "hello! how can i assist you today?") {
+            responseWithSource += `\n\nSource: ${sourceUrl}`;
+        }
+
+        res.json({ response: responseWithSource });
+
+    } catch (error) {
+        console.error("❌ Server Error:", error);
+        res.status(500).json({ error: "An error occurred" });
+    }
+});
+
+/**
+ * Helper function to handle fallback GPT if no relevant SFU docs
+ */
+async function handleFallbackLLM(message, res) {
+    // Make a normal LLM call
+    const fallbackLLM = new ChatGoogleGenerativeAI({
+      model: "gemini-2.5-flash",
+      apiKey: process.env.GEMINI_API_KEY,
+      maxOutputTokens: 1000
+    });
+  
+    // Provide a system prompt for general conversation
+    const fallbackResponse = await fallbackLLM.call([
+      {
+        role: "system",
+        content: "You are a friendly chatbot that can discuss any topic, not limited to SFU."
+      },
+      {
+        role: "user",
+        content: message
+      }
+    ]);
+  
+    // fallbackResponse.text contains the LLM's response
+    return res.json({ response: fallbackResponse.text });
+  }
+
+// News endpoint
+app.get("/api/full-news", async (req, res) => {
+  try {
+    const browser = await puppeteer.launch({
+      headless: "new",
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    const page = await browser.newPage();
+
+    await page.goto("https://www.sfu.ca/sfunews/stories/news.html", {
+      waitUntil: "networkidle2"
+    });
+
+    const content = await page.content();
+    const $ = cheerio.load(content);
+
+    // Convert relative URLs to absolute
+    $("img").each((i, el) => {
+      const src = $(el).attr("src");
+      if (src && src.startsWith("/")) {
+        $(el).attr("src", "https://www.sfu.ca" + src);
+      }
+    });
+
+    $("a").each((i, el) => {
+      const href = $(el).attr("href");
+      if (href && href.startsWith("/")) {
+        $(el).attr("href", "https://www.sfu.ca" + href);
+      }
+    });
+
+    const newsHTML = $(".cmp-result-item").map((i, el) => $.html(el)).get().join("");
+
+    await browser.close();
+    res.json({ news: newsHTML });
+  } catch (err) {
+    console.error("Error scraping full news:", err);
+    res.status(500).json({ error: "Failed to scrape full news." });
+  }
+});
+
+// Events endpoint
+app.get("/api/events", async (req, res) => {
+  try {
+    let eventsHTML = "";
+    
+    try {
+      const { data } = await axios.get("https://events.sfu.ca/");
+      const $ = cheerio.load(data);
+      
+      const events = [];
+      $(".event-item, .event, .calendar-event").each((i, el) => {
+        const $event = $(el);
+        const title = $event.find("h3, h2, .title, .event-title").first().text().trim();
+        const date = $event.find(".date, .event-date, .time").first().text().trim();
+        const description = $event.find("p, .description, .summary").first().text().trim();
+        const link = $event.find("a").first().attr("href");
+        
+        if (title) {
+          events.push({
+            title,
+            date,
+            description: description.substring(0, 150) + "...",
+            link: link ? (link.startsWith("http") ? link : "https://events.sfu.ca" + link) : "https://events.sfu.ca"
+          });
+        }
+      });
+      
+      if (events.length > 0) {
+        eventsHTML = events.slice(0, 6).map((event, index) => {
+          const fallbackImages = [
+            'https://www.sfu.ca/content/dam/sfu/sfunews/2024/09/SFU-campus-aerial-view.jpg',
+            'https://www.sfu.ca/content/dam/sfu/sfunews/2024/08/students-studying.jpg',
+            'https://www.sfu.ca/content/dam/sfu/sfunews/2024/07/sfu-library.jpg'
+          ];
+          
+          const imageUrl = fallbackImages[index % fallbackImages.length];
+          
+          return `
+            <div class="cmp-result-item event-item">
+              <img src="${imageUrl}" alt="SFU Event" />
+              <div class="cmp-result-card-content">
+                <div class="cmp-result-card-title">
+                  <a href="${event.link}" target="_blank">${event.title}</a>
+                </div>
+                <div class="cmp-result-card-date event-location">${event.date}</div>
+                <div class="cmp-result-card-summary">${event.description}</div>
+                <div class="cmp-result-card-link">
+                  <a href="${event.link}" target="_blank">Learn more</a>
+                </div>
+              </div>
+            </div>
+          `;
+        }).join("");
+      }
+    } catch (error) {
+      console.log("Primary events source failed, using fallback");
+    }
+    
+    // Fallback events if scraping fails
+    if (!eventsHTML) {
+      const fallbackEvents = [
+        { title: "SFU Orientation Week", date: "September 2024", description: "Welcome new students to SFU with orientation activities and campus tours." },
+        { title: "Career Fair", date: "October 2024", description: "Connect with employers and explore career opportunities." },
+        { title: "Research Symposium", date: "November 2024", description: "Showcase of undergraduate and graduate research projects." }
+      ];
+
+      eventsHTML = fallbackEvents.map((event, index) => {
+        const eventImages = [
+          'https://www.sfu.ca/content/dam/sfu/sfunews/2024/09/SFU-campus-aerial-view.jpg',
+          'https://www.sfu.ca/content/dam/sfu/sfunews/2024/08/students-studying.jpg',
+          'https://www.sfu.ca/content/dam/sfu/sfunews/2024/07/sfu-library.jpg'
+        ];
+        
+        return `
+          <div class="cmp-result-item event-item">
+            <img src="${eventImages[index]}" alt="SFU Event" />
+            <div class="cmp-result-card-content">
+              <div class="cmp-result-card-title">
+                <a href="https://events.sfu.ca" target="_blank">${event.title}</a>
+              </div>
+              <div class="cmp-result-card-date event-location">${event.date}</div>
+              <div class="cmp-result-card-summary">${event.description}</div>
+              <div class="cmp-result-card-link">
+                <a href="https://events.sfu.ca" target="_blank">Learn more</a>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+    
+    res.json({ events: eventsHTML });
+  } catch (error) {
+    console.error("Error fetching events:", error);
+    res.json({
+      events: `
+        <div class="cmp-result-item event-item">
+          <div class="cmp-result-card-content">
+            <div class="cmp-result-card-title">
+              <a href="https://events.sfu.ca" target="_blank">SFU Events</a>
+            </div>
+            <div class="cmp-result-card-date">Upcoming</div>
+            <div class="cmp-result-card-summary">Visit the official SFU Events page for the latest campus activities and events.</div>
+          </div>
+        </div>
+      `,
+    });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
